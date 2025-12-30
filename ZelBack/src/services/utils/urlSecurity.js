@@ -14,9 +14,63 @@
 
 const { URL } = require('url');
 const dns = require('dns');
+const net = require('net');
 const { promisify } = require('util');
 
 const dnsLookup = promisify(dns.lookup);
+
+function normalizeIpString(ip) {
+  if (!ip || typeof ip !== 'string') {
+    return ip;
+  }
+
+  // URL.hostname includes brackets for IPv6 literals: "[::1]"
+  let normalized = ip.trim();
+  if (normalized.startsWith('[') && normalized.endsWith(']')) {
+    normalized = normalized.slice(1, -1);
+  }
+
+  // Strip zone identifiers (e.g. "fe80::1%eth0")
+  const zoneIndex = normalized.indexOf('%');
+  if (zoneIndex !== -1) {
+    normalized = normalized.slice(0, zoneIndex);
+  }
+
+  return normalized;
+}
+
+function ipv6MappedToIpv4(ipv6) {
+  if (!ipv6 || typeof ipv6 !== 'string') {
+    return null;
+  }
+
+  const normalized = normalizeIpString(ipv6).toLowerCase();
+
+  if (!normalized.startsWith('::ffff:')) {
+    return null;
+  }
+
+  const mappedPart = normalized.slice('::ffff:'.length);
+
+  // IPv4-mapped can be in dotted-decimal form: ::ffff:127.0.0.1
+  if (mappedPart.includes('.')) {
+    return mappedPart;
+  }
+
+  // Or in hex hextets: ::ffff:7f00:1
+  const hextets = mappedPart.split(':');
+  if (hextets.length !== 2) {
+    return null;
+  }
+
+  const high = parseInt(hextets[0], 16);
+  const low = parseInt(hextets[1], 16);
+  if (!Number.isFinite(high) || !Number.isFinite(low) || high < 0 || high > 0xffff || low < 0 || low > 0xffff) {
+    return null;
+  }
+
+  return `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+}
 
 /**
  * IPv4 private/reserved ranges that should be blocked
@@ -81,10 +135,19 @@ function isBlockedIP(ip) {
     return true; // Block if no IP provided
   }
 
-  // Strip brackets from IPv6 addresses (URL hostname format is [::1])
-  let normalizedIp = ip;
-  if (ip.startsWith('[') && ip.endsWith(']')) {
-    normalizedIp = ip.slice(1, -1);
+  const normalizedIp = normalizeIpString(ip).toLowerCase();
+
+  // If this is an IPv4-mapped IPv6 address, convert and check as IPv4.
+  // Node's URL parser normalizes `::ffff:127.0.0.1` to `::ffff:7f00:1`,
+  // so regex-only checks are insufficient.
+  const mappedIpv4 = ipv6MappedToIpv4(normalizedIp);
+  if (mappedIpv4) {
+    for (const pattern of BLOCKED_IPV4_PATTERNS) {
+      if (pattern.test(mappedIpv4)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // Check IPv4 patterns
@@ -227,21 +290,18 @@ async function validateUrlWithDns(inputUrl, options = {}) {
   const parsed = new URL(validatedUrl);
   const { hostname } = parsed;
 
-  // Skip DNS check if hostname is already an IP
-  // (already validated by validateUrl)
-  if (isBlockedIP(hostname)) {
-    // This shouldn't happen as validateUrl already checks, but double-check
+  const hostnameForIpChecks = normalizeIpString(hostname);
+
+  // This shouldn't happen as validateUrl already checks, but keep defense-in-depth.
+  if (!allowPrivate && isBlockedIP(hostname)) {
     throw new Error('Access to private/internal IP addresses is not allowed');
   }
 
   // If not an IP address, resolve DNS and check the result
   // Skip if allowPrivate is true
   if (!allowPrivate) {
-    // Check if hostname looks like an IP address
-    const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/;
-    const ipv6Pattern = /^[0-9a-fA-F:]+$/;
-
-    if (!ipv4Pattern.test(hostname) && !ipv6Pattern.test(hostname)) {
+    // Skip DNS check for IP literals (IPv4 or IPv6)
+    if (!net.isIP(hostnameForIpChecks)) {
       try {
         const result = await dnsLookup(hostname, { all: true });
         const addresses = Array.isArray(result) ? result : [result];

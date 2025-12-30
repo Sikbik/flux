@@ -88,6 +88,13 @@ describe('urlSecurity', () => {
       expect(() => validateUrl('http://[::1]:8080/')).to.throw('private/internal IP');
     });
 
+    it('should block IPv6-mapped IPv4 loopback', () => {
+      expect(() => validateUrl('http://[::ffff:127.0.0.1]/')).to.throw('private/internal IP');
+      expect(() => validateUrl('http://[::FFFF:127.0.0.1]:16127/flux/version')).to.throw('private/internal IP');
+      // Node normalizes the hostname to hex form: [::ffff:7f00:1]
+      expect(() => validateUrl('http://[::ffff:7f00:1]/')).to.throw('private/internal IP');
+    });
+
     it('should block IPv6 link-local', () => {
       expect(() => validateUrl('http://[fe80::1]/')).to.throw('private/internal IP');
       expect(() => validateUrl('http://[fe80::1234:5678]/')).to.throw('private/internal IP');
@@ -155,6 +162,15 @@ describe('urlSecurity', () => {
       expect(isBlockedIP('::1')).to.be.true;
     });
 
+    it('should return true for IPv6-mapped loopback', () => {
+      expect(isBlockedIP('::ffff:7f00:1')).to.be.true;
+      expect(isBlockedIP('[::ffff:7f00:1]')).to.be.true;
+    });
+
+    it('should return false for IPv6-mapped public addresses', () => {
+      expect(isBlockedIP('::ffff:8.8.8.8')).to.be.false;
+    });
+
     it('should return true for null/undefined', () => {
       expect(isBlockedIP(null)).to.be.true;
       expect(isBlockedIP(undefined)).to.be.true;
@@ -208,6 +224,11 @@ describe('urlSecurity', () => {
   });
 
   describe('validateUrlWithDns', () => {
+    it('should allow public IPv6 literals without DNS lookup', async () => {
+      const result = await validateUrlWithDns('https://[2606:4700:4700::1111]/');
+      expect(result).to.equal('https://[2606:4700:4700::1111]/');
+    });
+
     it('should validate URLs that resolve to public IPs', async () => {
       // This test relies on example.com resolving to a public IP
       const result = await validateUrlWithDns('https://example.com/');

@@ -2,6 +2,7 @@ const df = require('node-df');
 const fs = require('fs').promises;
 const fs2 = require('fs');
 const util = require('util');
+const { URL } = require('url');
 const log = require('../lib/log');
 const axios = require('axios');
 const path = require('path');
@@ -11,7 +12,33 @@ const messageHelper = require('./messageHelper');
 const verificationHelper = require('./verificationHelper');
 const exec = util.promisify(require('child_process').exec);
 const { sanitizePath, validateFilename } = require('./utils/pathSecurity');
-const { validateUrl } = require('./utils/urlSecurity');
+const { validateUrlWithDns } = require('./utils/urlSecurity');
+
+async function requestWithValidatedRedirects(axiosConfig, maxRedirects = 5) {
+  let currentUrl = await validateUrlWithDns(axiosConfig.url);
+
+  for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
+    const response = await axios.request({
+      ...axiosConfig,
+      url: currentUrl,
+      maxRedirects: 0,
+      validateStatus: (status) => status >= 200 && status < 400,
+    });
+
+    if (response.status >= 300 && response.status < 400 && response.headers?.location) {
+      if (axiosConfig.responseType === 'stream' && response.data && typeof response.data.destroy === 'function') {
+        response.data.destroy();
+      }
+      currentUrl = await validateUrlWithDns(new URL(response.headers.location, currentUrl).href);
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    return { response, url: currentUrl };
+  }
+
+  throw new Error('Too many redirects');
+}
 
 /**
  * Converts file sizes to a specified unit or the most appropriate unit based on the total size.
@@ -127,9 +154,11 @@ async function getFileSize(filePath) {
  */
 async function getRemoteFileSize(fileurl, multiplier, decimal, number = false) {
   try {
-    // Validate URL to prevent SSRF attacks
-    const validatedUrl = validateUrl(fileurl);
-    const head = await axios.head(validatedUrl);
+    const { response: head } = await requestWithValidatedRedirects({
+      method: 'head',
+      url: fileurl,
+      timeout: 15000,
+    });
     const contentLengthHeader = head.headers['content-length'] || head.headers['Content-Length'];
     const fileSizeInBytes = parseInt(contentLengthHeader, 10);
     if (!Number.isFinite(fileSizeInBytes)) {
@@ -283,19 +312,18 @@ async function checkFileExists(filePath) {
  */
 async function downloadFileFromUrl(url, localpath, component, rename = false, retries = 0) {
   try {
-    // Validate URL to prevent SSRF attacks
-    const validatedUrl = validateUrl(url);
-    let filepath = `${localpath}/backup_${component.toLowerCase()}.tar.gz`;
-    if (!rename) {
-      const fileNameArray = validatedUrl.split('/');
-      const fileName = fileNameArray[fileNameArray.length - 1];
-      filepath = `${localpath}/${fileName}`;
-    }
-    const response = await axios.get(validatedUrl, {
+    const { response, url: finalUrl } = await requestWithValidatedRedirects({
+      method: 'get',
+      url,
       responseType: 'stream',
-      maxRedirects: 5,
       timeout: 15000,
     });
+    let filepath = `${localpath}/backup_${component.toLowerCase()}.tar.gz`;
+    if (!rename) {
+      const parsedUrl = new URL(finalUrl);
+      const fileNameFromUrl = path.basename(parsedUrl.pathname) || `backup_${component.toLowerCase()}.tar.gz`;
+      filepath = `${localpath}/${fileNameFromUrl}`;
+    }
     const dirPath = path.dirname(filepath);
     // Create directory if it doesn't exist
     await fs.mkdir(dirPath, { recursive: true });
